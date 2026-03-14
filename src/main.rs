@@ -14,7 +14,7 @@ use crossterm::{
 use fontdue::{Font, FontSettings};
 use reqwest::blocking::Client;
 use reqwest::header::USER_AGENT;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp,
     collections::{HashMap, HashSet},
@@ -25,6 +25,8 @@ use std::{
 };
 
 const PREVIEW_SAMPLE_TEXT: &str = "SHELL QUEST\nmade by pawel potepa";
+const DEFAULT_ALPHANUMERIC_CHARS: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RasterProfile {
@@ -32,6 +34,32 @@ enum RasterProfile {
     Dense,
     Binary,
     Inverted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RasterMode {
+    Ascii,
+    TerminalPixels,
+}
+
+impl RasterMode {
+    fn all() -> &'static [RasterMode] {
+        &[RasterMode::Ascii, RasterMode::TerminalPixels]
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            RasterMode::Ascii => "ascii",
+            RasterMode::TerminalPixels => "terminal-pixels",
+        }
+    }
+
+    fn from_id(value: &str) -> Option<Self> {
+        match value {
+            "cell" => Some(RasterMode::TerminalPixels),
+            _ => Self::all().iter().copied().find(|mode| mode.id() == value),
+        }
+    }
 }
 
 impl RasterProfile {
@@ -102,6 +130,8 @@ enum Command {
     Preview(PreviewArgs),
     /// Generate terminal sprite text into file.
     Generate(GenerateArgs),
+    /// Export every character as a standalone glyph asset pack.
+    ExportGlyphs(ExportGlyphsArgs),
 }
 
 #[derive(Args)]
@@ -117,15 +147,21 @@ struct PreviewArgs {
     /// Local TTF file path.
     #[arg(long)]
     font_file: Option<PathBuf>,
-    /// Text to preview.
-    #[arg(long, default_value = PREVIEW_SAMPLE_TEXT)]
-    text: String,
+    /// Text to preview (higher priority than --chars).
+    #[arg(long)]
+    text: Option<String>,
+    /// Characters to preview as a glyph sample line.
+    #[arg(long)]
+    chars: Option<String>,
     /// Rasterizer size in px.
     #[arg(long, default_value_t = 24.0)]
     size: f32,
     /// Raster profile: classic|dense|binary|inverted.
     #[arg(long, default_value = "classic")]
     profile: String,
+    /// Render mode: ascii|terminal-pixels.
+    #[arg(long, default_value = "ascii")]
+    mode: String,
 }
 
 #[derive(Args)]
@@ -141,18 +177,54 @@ struct GenerateArgs {
     /// Local TTF file path.
     #[arg(long)]
     font_file: Option<PathBuf>,
-    /// Text to rasterize.
+    /// Text to rasterize (higher priority than --chars).
     #[arg(long)]
-    text: String,
+    text: Option<String>,
+    /// Characters to rasterize as a glyph sample line.
+    #[arg(long)]
+    chars: Option<String>,
     /// Rasterizer size in px.
     #[arg(long, default_value_t = 24.0)]
     size: f32,
     /// Raster profile: classic|dense|binary|inverted.
     #[arg(long, default_value = "classic")]
     profile: String,
+    /// Render mode: ascii|terminal-pixels.
+    #[arg(long, default_value = "ascii")]
+    mode: String,
     /// Output file path (sprite text).
     #[arg(long)]
     output: PathBuf,
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("font_source")
+        .required(true)
+        .args(["font", "font_file"]),
+))]
+struct ExportGlyphsArgs {
+    /// Font family name from bundled Google-font catalog.
+    #[arg(long)]
+    font: Option<String>,
+    /// Local TTF file path.
+    #[arg(long)]
+    font_file: Option<PathBuf>,
+    /// Characters to export as glyph files (defaults to alphanumerics).
+    #[arg(long)]
+    chars: Option<String>,
+    /// Rasterizer size in px.
+    #[arg(long, default_value_t = 24.0)]
+    size: f32,
+    /// Raster profile: classic|dense|binary|inverted.
+    #[arg(long, default_value = "classic")]
+    profile: String,
+    /// Render mode: ascii|terminal-pixels.
+    #[arg(long, default_value = "ascii")]
+    mode: String,
+    /// Output root directory, e.g. mods/base/assets/fonts.
+    #[arg(long)]
+    output_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -185,6 +257,27 @@ struct GoogleWebfontItem {
     license: String,
 }
 
+#[derive(Debug, Serialize)]
+struct GlyphManifest {
+    schema_version: u32,
+    font_family: String,
+    font_variant: String,
+    font_label: String,
+    size_px: f32,
+    profile: String,
+    mode: String,
+    glyphs: Vec<GlyphManifestEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct GlyphManifestEntry {
+    character: String,
+    codepoint: String,
+    file: String,
+    width: usize,
+    height: usize,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let catalog = load_catalog()?;
@@ -194,6 +287,7 @@ fn main() -> Result<()> {
         Some(Command::List) => run_list(&catalog.fonts),
         Some(Command::Preview(args)) => run_preview(&catalog.fonts, args),
         Some(Command::Generate(args)) => run_generate(&catalog.fonts, args),
+        Some(Command::ExportGlyphs(args)) => run_export_glyphs(&catalog.fonts, args),
     }
 }
 
@@ -212,16 +306,20 @@ fn run_list(fonts: &[FontEntry]) -> Result<()> {
 
 fn run_preview(fonts: &[FontEntry], args: PreviewArgs) -> Result<()> {
     let profile = parse_profile(&args.profile)?;
+    let mode = parse_mode(&args.mode)?;
     let font_bytes = resolve_font_bytes(fonts, args.font.as_deref(), args.font_file.as_deref())?;
-    let art = rasterize_text_to_ascii(&font_bytes, &args.text, args.size, profile)?;
+    let text = resolve_render_text(args.text.as_deref(), args.chars.as_deref())?;
+    let art = rasterize_text_to_ascii(&font_bytes, &text, args.size, profile, mode)?;
     println!("{art}");
     Ok(())
 }
 
 fn run_generate(fonts: &[FontEntry], args: GenerateArgs) -> Result<()> {
     let profile = parse_profile(&args.profile)?;
+    let mode = parse_mode(&args.mode)?;
     let font_bytes = resolve_font_bytes(fonts, args.font.as_deref(), args.font_file.as_deref())?;
-    let art = rasterize_text_to_ascii(&font_bytes, &args.text, args.size, profile)?;
+    let text = resolve_render_text(args.text.as_deref(), args.chars.as_deref())?;
+    let art = rasterize_text_to_ascii(&font_bytes, &text, args.size, profile, mode)?;
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)
@@ -231,6 +329,75 @@ fn run_generate(fonts: &[FontEntry], args: GenerateArgs) -> Result<()> {
         .with_context(|| format!("failed to write output file {}", args.output.display()))?;
 
     println!("generated {}", args.output.display());
+    Ok(())
+}
+
+fn run_export_glyphs(fonts: &[FontEntry], args: ExportGlyphsArgs) -> Result<()> {
+    let profile = parse_profile(&args.profile)?;
+    let mode = parse_mode(&args.mode)?;
+    let font_bytes = resolve_font_bytes(fonts, args.font.as_deref(), args.font_file.as_deref())?;
+    let glyph_text = resolve_render_text(None, args.chars.as_deref())?;
+    let font_label = resolve_font_label(args.font.as_deref(), args.font_file.as_deref())?;
+    let font_dir = slugify(&font_label);
+    let size_dir = size_slug(args.size);
+    let output_root = args.output_dir.join(size_dir).join(font_dir);
+    let glyph_dir = output_root.join("glyphs");
+    fs::create_dir_all(&glyph_dir)
+        .with_context(|| format!("failed to create glyph directory {}", glyph_dir.display()))?;
+
+    let unique_chars = unique_glyph_chars(&glyph_text);
+    if unique_chars.is_empty() {
+        bail!("no glyph characters to export");
+    }
+
+    let mut entries = Vec::with_capacity(unique_chars.len());
+    for ch in unique_chars {
+        let glyph_art =
+            rasterize_text_to_ascii(&font_bytes, &ch.to_string(), args.size, profile, mode)?;
+        let file_name = glyph_file_name(ch);
+        let file_path = glyph_dir.join(&file_name);
+        fs::write(&file_path, format!("{glyph_art}\n"))
+            .with_context(|| format!("failed to write glyph file {}", file_path.display()))?;
+
+        let (width, height) = glyph_dimensions(&glyph_art);
+        entries.push(GlyphManifestEntry {
+            character: ch.to_string(),
+            codepoint: format!("U+{:04X}", ch as u32),
+            file: format!("glyphs/{file_name}"),
+            width,
+            height,
+        });
+    }
+
+    let manifest = GlyphManifest {
+        schema_version: 1,
+        font_family: args
+            .font
+            .clone()
+            .or_else(|| {
+                args.font_file
+                    .as_ref()
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            })
+            .unwrap_or_else(|| "custom".to_string()),
+        font_variant: "regular".to_string(),
+        font_label,
+        size_px: args.size,
+        profile: profile.id().to_string(),
+        mode: mode.id().to_string(),
+        glyphs: entries,
+    };
+    let manifest_path = output_root.join("manifest.yaml");
+    let manifest_raw =
+        serde_yaml::to_string(&manifest).context("failed to serialize glyph manifest")?;
+    fs::write(&manifest_path, manifest_raw)
+        .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+
+    println!(
+        "exported {} glyphs into {}",
+        manifest.glyphs.len(),
+        output_root.display()
+    );
     Ok(())
 }
 
@@ -357,8 +524,13 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
                     }
                     KeyCode::Char('C') => {
                         let entry = &browser_fonts[selected];
-                        let command =
-                            build_generate_command(entry, &sample_text, preview_size, profile);
+                        let command = build_generate_command(
+                            entry,
+                            &sample_text,
+                            preview_size,
+                            profile,
+                            RasterMode::Ascii,
+                        );
                         copy_text_osc52(&command, &mut stdout)?;
                         message = "copied generate command to clipboard".to_string();
                     }
@@ -497,9 +669,15 @@ fn ensure_preview(
         return;
     }
 
-    match load_font_bytes(entry)
-        .and_then(|bytes| rasterize_text_to_ascii(&bytes, sample_text, preview_size, profile))
-    {
+    match load_font_bytes(entry).and_then(|bytes| {
+        rasterize_text_to_ascii(
+            &bytes,
+            sample_text,
+            preview_size,
+            profile,
+            RasterMode::Ascii,
+        )
+    }) {
         Ok(preview) => {
             cache.insert(cache_key, preview);
             *message = format!(
@@ -659,18 +837,21 @@ fn build_generate_command(
     sample_text: &str,
     preview_size: f32,
     profile: RasterProfile,
+    mode: RasterMode,
 ) -> String {
     let output = format!(
-        "mods/base/assets/fonts/{}-{}-{}.txt",
+        "mods/base/assets/fonts/{}-{}-{}-{}.txt",
         slugify(&entry.family),
         slugify(&entry.variant),
-        profile.id()
+        profile.id(),
+        mode.id()
     );
     format!(
-        "cargo run -p ttf-rasterizer -- generate --font {} --text {} --profile {} --size {:.0} --output {}",
+        "cargo run -p ttf-rasterizer -- generate --font {} --text {} --profile {} --mode {} --size {:.0} --output {}",
         shell_quote(&entry.family),
         shell_quote(sample_text),
         profile.id(),
+        mode.id(),
         preview_size,
         shell_quote(&output),
     )
@@ -786,6 +967,102 @@ fn parse_profile(value: &str) -> Result<RasterProfile> {
                 .join(", ")
         )
     })
+}
+
+fn parse_mode(value: &str) -> Result<RasterMode> {
+    let normalized = value.trim().to_ascii_lowercase();
+    RasterMode::from_id(&normalized).ok_or_else(|| {
+        anyhow!(
+            "unknown mode '{value}', expected one of: {}",
+            RasterMode::all()
+                .iter()
+                .map(|mode| mode.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+fn resolve_render_text(text: Option<&str>, chars: Option<&str>) -> Result<String> {
+    if text.is_some() && chars.is_some() {
+        bail!("use either --text or --chars, not both");
+    }
+    if let Some(value) = text {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("--text cannot be empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+    if let Some(value) = chars {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("--chars cannot be empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+    Ok(DEFAULT_ALPHANUMERIC_CHARS.to_string())
+}
+
+fn unique_glyph_chars(input: &str) -> Vec<char> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for ch in input.chars() {
+        if matches!(ch, '\n' | '\r') {
+            continue;
+        }
+        if seen.insert(ch) {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn glyph_file_name(ch: char) -> String {
+    if ch.is_ascii_alphanumeric() {
+        return format!("{ch}.txt");
+    }
+    match ch {
+        ' ' => "space.txt".to_string(),
+        '-' => "dash.txt".to_string(),
+        '_' => "underscore.txt".to_string(),
+        _ => format!("U+{:04X}.txt", ch as u32),
+    }
+}
+
+fn size_slug(size: f32) -> String {
+    let rounded = size.round().clamp(1.0, 9999.0) as u32;
+    format!("{rounded}px")
+}
+
+fn glyph_dimensions(glyph_art: &str) -> (usize, usize) {
+    let lines: Vec<&str> = glyph_art.lines().collect();
+    let height = lines.len();
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    (width, height)
+}
+
+fn resolve_font_label(font: Option<&str>, font_file: Option<&Path>) -> Result<String> {
+    if let Some(name) = font {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("--font cannot be empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+    if let Some(path) = font_file {
+        if let Some(stem) = path.file_stem() {
+            let value = stem.to_string_lossy().trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    bail!("failed to resolve font label")
 }
 
 fn resolve_font_bytes(
@@ -1022,12 +1299,13 @@ fn rasterize_text_to_ascii(
     text: &str,
     size: f32,
     profile: RasterProfile,
+    mode: RasterMode,
 ) -> Result<String> {
     let font = Font::from_bytes(font_bytes, FontSettings::default())
         .map_err(|error| anyhow!("failed to parse font bytes: {error}"))?;
     let mut lines = Vec::new();
     for (line_idx, line) in text.lines().enumerate() {
-        let rendered = rasterize_line(&font, line, size, profile);
+        let rendered = rasterize_line(&font, line, size, profile, mode);
         lines.extend(rendered);
         if line_idx + 1 < text.lines().count() {
             lines.push(String::new());
@@ -1037,7 +1315,13 @@ fn rasterize_text_to_ascii(
     Ok(trim_vertical(lines).join("\n"))
 }
 
-fn rasterize_line(font: &Font, text: &str, size: f32, profile: RasterProfile) -> Vec<String> {
+fn rasterize_line(
+    font: &Font,
+    text: &str,
+    size: f32,
+    profile: RasterProfile,
+    mode: RasterMode,
+) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
@@ -1093,7 +1377,10 @@ fn rasterize_line(font: &Font, text: &str, size: f32, profile: RasterProfile) ->
         }
     }
 
-    let ramp: Vec<char> = profile.ramp().chars().collect();
+    let ramp: Vec<char> = match mode {
+        RasterMode::Ascii => profile.ramp().chars().collect(),
+        RasterMode::TerminalPixels => terminal_pixel_ramp(profile),
+    };
     let mut lines = Vec::with_capacity(max_height);
     for y in 0..max_height {
         let mut line = String::with_capacity(pen_x);
@@ -1117,6 +1404,14 @@ fn trim_vertical(lines: Vec<String>) -> Vec<String> {
     match (first, last) {
         (Some(start), Some(end)) => lines[start..=end].to_vec(),
         _ => vec![String::new()],
+    }
+}
+
+fn terminal_pixel_ramp(profile: RasterProfile) -> Vec<char> {
+    match profile {
+        RasterProfile::Binary => vec![' ', '█'],
+        RasterProfile::Inverted => vec!['█', '▓', '▒', '░', ' '],
+        RasterProfile::Classic | RasterProfile::Dense => vec![' ', '░', '▒', '▓', '█'],
     }
 }
 
@@ -1176,8 +1471,9 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_generate_command, filter_fonts, parse_export_var, parse_profile, shell_quote,
-        slugify, truncate_to_width, FontEntry, RasterProfile,
+        build_generate_command, filter_fonts, glyph_file_name, parse_export_var, parse_mode,
+        parse_profile, resolve_render_text, shell_quote, size_slug, slugify, truncate_to_width,
+        unique_glyph_chars, FontEntry, RasterMode, RasterProfile,
     };
 
     #[test]
@@ -1203,6 +1499,23 @@ mod tests {
             RasterProfile::Dense
         );
         assert!(parse_profile("unknown").is_err());
+    }
+
+    #[test]
+    fn parses_raster_modes() {
+        assert_eq!(
+            parse_mode("ascii").expect("ascii mode should parse"),
+            RasterMode::Ascii
+        );
+        assert_eq!(
+            parse_mode("terminal-pixels").expect("terminal-pixels mode should parse"),
+            RasterMode::TerminalPixels
+        );
+        assert_eq!(
+            parse_mode("cell").expect("cell alias should parse"),
+            RasterMode::TerminalPixels
+        );
+        assert!(parse_mode("unknown").is_err());
     }
 
     #[test]
@@ -1257,14 +1570,58 @@ mod tests {
             ttf_url: "u".to_string(),
             license: "OFL".to_string(),
         };
-        let command = build_generate_command(&entry, "SHELL QUEST", 24.0, RasterProfile::Dense);
+        let command = build_generate_command(
+            &entry,
+            "SHELL QUEST",
+            24.0,
+            RasterProfile::Dense,
+            RasterMode::TerminalPixels,
+        );
         assert!(command.contains("--font 'JetBrains Mono'"));
         assert!(command.contains("--text 'SHELL QUEST'"));
         assert!(command.contains("--profile dense"));
+        assert!(command.contains("--mode terminal-pixels"));
     }
 
     #[test]
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn resolves_render_text_inputs() {
+        assert!(resolve_render_text(Some("HELLO"), Some("ABC")).is_err());
+        assert_eq!(
+            resolve_render_text(Some("HELLO"), None).expect("text should resolve"),
+            "HELLO".to_string()
+        );
+        assert_eq!(
+            resolve_render_text(None, Some("ABC123")).expect("chars should resolve"),
+            "ABC123".to_string()
+        );
+        assert_eq!(
+            resolve_render_text(None, None).expect("default should resolve"),
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".to_string()
+        );
+    }
+
+    #[test]
+    fn keeps_unique_glyph_char_order() {
+        assert_eq!(unique_glyph_chars("AABcaA\n"), vec!['A', 'B', 'c', 'a']);
+    }
+
+    #[test]
+    fn builds_glyph_file_names() {
+        assert_eq!(glyph_file_name('A'), "A.txt");
+        assert_eq!(glyph_file_name('a'), "a.txt");
+        assert_eq!(glyph_file_name('2'), "2.txt");
+        assert_eq!(glyph_file_name(' '), "space.txt");
+        assert_eq!(glyph_file_name('?'), "U+003F.txt");
+    }
+
+    #[test]
+    fn formats_size_slug() {
+        assert_eq!(size_slug(24.0), "24px");
+        assert_eq!(size_slug(23.6), "24px");
     }
 }
