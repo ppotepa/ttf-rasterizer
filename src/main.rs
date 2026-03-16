@@ -371,7 +371,11 @@ fn run_export_glyphs(fonts: &[FontEntry], args: ExportGlyphsArgs) -> Result<()> 
     let font_label = resolve_font_label(args.font.as_deref(), args.font_file.as_deref())?;
     let font_dir = slugify(&font_label);
     let size_dir = size_slug(args.size);
-    let output_root = args.output_dir.join(size_dir).join(font_dir);
+    let output_root = args
+        .output_dir
+        .join(&font_dir)
+        .join(&size_dir)
+        .join(mode.id());
     let glyph_dir = output_root.join("glyphs");
     fs::create_dir_all(&glyph_dir)
         .with_context(|| format!("failed to create glyph directory {}", glyph_dir.display()))?;
@@ -380,23 +384,24 @@ fn run_export_glyphs(fonts: &[FontEntry], args: ExportGlyphsArgs) -> Result<()> 
     if unique_chars.is_empty() {
         bail!("no glyph characters to export");
     }
+    let font = Font::from_bytes(font_bytes, FontSettings::default())
+        .map_err(|error| anyhow!("failed to parse font bytes: {error}"))?;
+    let line_metrics = line_box_for_chars(&font, &unique_chars, args.size);
 
     let mut entries = Vec::with_capacity(unique_chars.len());
     for ch in unique_chars {
-        let glyph_art =
-            rasterize_text_to_ascii(&font_bytes, &ch.to_string(), args.size, profile, mode)?;
+        let glyph = rasterize_glyph_for_export(&font, ch, args.size, profile, mode, line_metrics);
         let file_name = glyph_file_name(ch);
         let file_path = glyph_dir.join(&file_name);
-        fs::write(&file_path, format!("{glyph_art}\n"))
+        fs::write(&file_path, format!("{}\n", glyph.art))
             .with_context(|| format!("failed to write glyph file {}", file_path.display()))?;
 
-        let (width, height) = glyph_dimensions(&glyph_art);
         entries.push(GlyphManifestEntry {
             character: ch.to_string(),
             codepoint: format!("U+{:04X}", ch as u32),
             file: format!("glyphs/{file_name}"),
-            width,
-            height,
+            width: glyph.width,
+            height: glyph.height,
         });
     }
 
@@ -974,7 +979,7 @@ fn build_generate_command(
     mode: RasterMode,
 ) -> String {
     let output = format!(
-        "mod/shell-quest/assets/fonts/generated/{}-{}-{}-{}.txt",
+        "mods/shell-quest/assets/fonts/generated/{}-{}-{}-{}.txt",
         slugify(&entry.family),
         slugify(&entry.variant),
         profile.id(),
@@ -1167,17 +1172,6 @@ fn glyph_file_name(ch: char) -> String {
 fn size_slug(size: f32) -> String {
     let rounded = size.round().clamp(1.0, 9999.0) as u32;
     format!("{rounded}px")
-}
-
-fn glyph_dimensions(glyph_art: &str) -> (usize, usize) {
-    let lines: Vec<&str> = glyph_art.lines().collect();
-    let height = lines.len();
-    let width = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-    (width, height)
 }
 
 fn resolve_font_label(font: Option<&str>, font_file: Option<&Path>) -> Result<String> {
@@ -1464,27 +1458,35 @@ fn rasterize_line(
         width: usize,
         height: usize,
         x: usize,
+        ascent: usize,
         bitmap: Vec<u8>,
     }
 
     let mut glyphs = Vec::new();
-    let mut max_height = 1usize;
+    let mut max_ascent = 1usize;
+    let mut max_descent = 0usize;
     let mut pen_x = 0usize;
 
     for ch in text.chars() {
         if ch == ' ' {
-            pen_x += (size * 0.35).ceil() as usize + 1;
+            let (space_metrics, _) = font.rasterize(' ', size);
+            let fallback = (size * 0.35).ceil() as usize + 1;
+            let advance = cmp::max(space_metrics.advance_width.ceil() as usize, fallback).max(1);
+            pen_x += advance;
             continue;
         }
 
         let (metrics, bitmap) = font.rasterize(ch, size);
         let advance = cmp::max((metrics.advance_width.ceil() as usize).saturating_add(1), 1);
         if metrics.width > 0 && metrics.height > 0 {
-            max_height = cmp::max(max_height, metrics.height);
+            let (ascent, descent) = glyph_ascent_descent(metrics.height, metrics.ymin);
+            max_ascent = cmp::max(max_ascent, ascent);
+            max_descent = cmp::max(max_descent, descent);
             glyphs.push(Glyph {
                 width: metrics.width,
                 height: metrics.height,
                 x: pen_x,
+                ascent,
                 bitmap,
             });
         }
@@ -1494,9 +1496,10 @@ fn rasterize_line(
     if pen_x == 0 {
         pen_x = 1;
     }
+    let max_height = (max_ascent + max_descent).max(1);
     let mut canvas = vec![0u8; max_height * pen_x];
     for glyph in glyphs {
-        let y_offset = (max_height.saturating_sub(glyph.height)) / 2;
+        let y_offset = max_ascent.saturating_sub(glyph.ascent);
         for row in 0..glyph.height {
             for col in 0..glyph.width {
                 let src_idx = row * glyph.width + col;
@@ -1511,7 +1514,7 @@ fn rasterize_line(
         }
     }
 
-    render_canvas(&canvas, pen_x, max_height, profile, mode)
+    render_canvas(&canvas, pen_x, max_height, profile, mode, true)
 }
 
 fn render_canvas(
@@ -1520,20 +1523,41 @@ fn render_canvas(
     height: usize,
     profile: RasterProfile,
     mode: RasterMode,
+    trim_vertical_output: bool,
 ) -> Vec<String> {
     match mode {
-        RasterMode::Ascii => render_ramp(canvas, width, height, profile.ramp().chars().collect()),
+        RasterMode::Ascii => render_ramp(
+            canvas,
+            width,
+            height,
+            profile.ramp().chars().collect(),
+            trim_vertical_output,
+        ),
         RasterMode::TerminalPixels => {
-            render_ramp(canvas, width, height, terminal_pixel_ramp(profile))
+            render_ramp(
+                canvas,
+                width,
+                height,
+                terminal_pixel_ramp(profile),
+                trim_vertical_output,
+            )
         }
-        RasterMode::BinaryBlock => render_binary_block(canvas, width, height, profile),
-        RasterMode::HalfBlock => render_half_block(canvas, width, height, profile),
-        RasterMode::QuadBlock => render_quad_block(canvas, width, height, profile),
-        RasterMode::Braille => render_braille(canvas, width, height, profile),
+        RasterMode::BinaryBlock => {
+            render_binary_block(canvas, width, height, profile, trim_vertical_output)
+        }
+        RasterMode::HalfBlock => render_half_block(canvas, width, height, profile, trim_vertical_output),
+        RasterMode::QuadBlock => render_quad_block(canvas, width, height, profile, trim_vertical_output),
+        RasterMode::Braille => render_braille(canvas, width, height, profile, trim_vertical_output),
     }
 }
 
-fn render_ramp(canvas: &[u8], width: usize, height: usize, ramp: Vec<char>) -> Vec<String> {
+fn render_ramp(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    ramp: Vec<char>,
+    trim_vertical_output: bool,
+) -> Vec<String> {
     let mut lines = Vec::with_capacity(height);
     for y in 0..height {
         let mut line = String::with_capacity(width);
@@ -1545,10 +1569,16 @@ fn render_ramp(canvas: &[u8], width: usize, height: usize, ramp: Vec<char>) -> V
         trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-    trim_vertical(lines)
+    finalize_lines(lines, trim_vertical_output)
 }
 
-fn render_binary_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+fn render_binary_block(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    profile: RasterProfile,
+    trim_vertical_output: bool,
+) -> Vec<String> {
     let mut lines = Vec::with_capacity(height);
     for y in 0..height {
         let mut line = String::with_capacity(width);
@@ -1563,10 +1593,16 @@ fn render_binary_block(canvas: &[u8], width: usize, height: usize, profile: Rast
         trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-    trim_vertical(lines)
+    finalize_lines(lines, trim_vertical_output)
 }
 
-fn render_half_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+fn render_half_block(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    profile: RasterProfile,
+    trim_vertical_output: bool,
+) -> Vec<String> {
     let out_h = height.div_ceil(2);
     let mut lines = Vec::with_capacity(out_h);
     for oy in 0..out_h {
@@ -1586,10 +1622,16 @@ fn render_half_block(canvas: &[u8], width: usize, height: usize, profile: Raster
         trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-    trim_vertical(lines)
+    finalize_lines(lines, trim_vertical_output)
 }
 
-fn render_quad_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+fn render_quad_block(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    profile: RasterProfile,
+    trim_vertical_output: bool,
+) -> Vec<String> {
     let out_w = width.div_ceil(2);
     let out_h = height.div_ceil(2);
     let mut lines = Vec::with_capacity(out_h);
@@ -1608,10 +1650,16 @@ fn render_quad_block(canvas: &[u8], width: usize, height: usize, profile: Raster
         trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-    trim_vertical(lines)
+    finalize_lines(lines, trim_vertical_output)
 }
 
-fn render_braille(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+fn render_braille(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    profile: RasterProfile,
+    trim_vertical_output: bool,
+) -> Vec<String> {
     let out_w = width.div_ceil(2);
     let out_h = height.div_ceil(4);
     let mut lines = Vec::with_capacity(out_h);
@@ -1654,7 +1702,7 @@ fn render_braille(canvas: &[u8], width: usize, height: usize, profile: RasterPro
         trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-    trim_vertical(lines)
+    finalize_lines(lines, trim_vertical_output)
 }
 
 fn is_ink(
@@ -1700,9 +1748,125 @@ fn quad_char(mask: u8) -> char {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LineBox {
+    ascent: usize,
+    height: usize,
+}
+
+#[derive(Debug)]
+struct ExportGlyph {
+    art: String,
+    width: usize,
+    height: usize,
+}
+
+fn glyph_ascent_descent(height: usize, ymin: i32) -> (usize, usize) {
+    let ascent = ((height as i32) + ymin).max(0) as usize;
+    let descent = ymin.saturating_neg() as usize;
+    (ascent, descent)
+}
+
+fn line_box_for_chars(font: &Font, chars: &[char], size: f32) -> LineBox {
+    let mut ascent = 1usize;
+    let mut descent = 0usize;
+    for &ch in chars {
+        if ch == ' ' {
+            continue;
+        }
+        let (metrics, _) = font.rasterize(ch, size);
+        if metrics.width == 0 || metrics.height == 0 {
+            continue;
+        }
+        let (a, d) = glyph_ascent_descent(metrics.height, metrics.ymin);
+        ascent = ascent.max(a);
+        descent = descent.max(d);
+    }
+    LineBox {
+        ascent,
+        height: (ascent + descent).max(1),
+    }
+}
+
+fn rasterize_glyph_for_export(
+    font: &Font,
+    ch: char,
+    size: f32,
+    profile: RasterProfile,
+    mode: RasterMode,
+    line_box: LineBox,
+) -> ExportGlyph {
+    if ch == ' ' {
+        return ExportGlyph {
+            art: String::new(),
+            width: 0,
+            height: 0,
+        };
+    }
+
+    let (metrics, bitmap) = font.rasterize(ch, size);
+    if metrics.width == 0 || metrics.height == 0 {
+        return ExportGlyph {
+            art: String::new(),
+            width: 1,
+            height: 1,
+        };
+    }
+
+    let (ascent, _) = glyph_ascent_descent(metrics.height, metrics.ymin);
+    let y_offset = line_box.ascent.saturating_sub(ascent);
+    let advance = cmp::max((metrics.advance_width.ceil() as usize).saturating_add(1), 1);
+    let canvas_w = cmp::max(advance, metrics.width);
+    let mut canvas = vec![0u8; line_box.height * canvas_w];
+
+    for row in 0..metrics.height {
+        for col in 0..metrics.width {
+            let src_idx = row * metrics.width + col;
+            let dst_x = col;
+            if dst_x >= canvas_w {
+                continue;
+            }
+            let dst_y = y_offset + row;
+            if dst_y >= line_box.height {
+                continue;
+            }
+            let dst_idx = dst_y * canvas_w + dst_x;
+            canvas[dst_idx] = cmp::max(canvas[dst_idx], bitmap[src_idx]);
+        }
+    }
+
+    let lines = render_canvas(&canvas, canvas_w, line_box.height, profile, mode, false);
+    let art = lines.join("\n");
+    let rendered_w = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+    let advance_cells = match mode {
+        RasterMode::QuadBlock | RasterMode::Braille => advance.div_ceil(2),
+        _ => advance,
+    };
+    let height = match mode {
+        RasterMode::HalfBlock | RasterMode::QuadBlock => line_box.height.div_ceil(2),
+        RasterMode::Braille => line_box.height.div_ceil(4),
+        _ => line_box.height,
+    };
+    ExportGlyph {
+        art,
+        width: rendered_w.max(advance_cells),
+        height: height.max(1),
+    }
+}
+
 fn trim_line_end_spaces(line: &mut String) {
     while line.ends_with(' ') {
         line.pop();
+    }
+}
+
+fn finalize_lines(lines: Vec<String>, trim_vertical_output: bool) -> Vec<String> {
+    if trim_vertical_output {
+        trim_vertical(lines)
+    } else if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
     }
 }
 

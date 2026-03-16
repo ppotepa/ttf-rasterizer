@@ -28,8 +28,8 @@ Small Rust CLI for terminal font sprite previews and generation.
 
 `export-glyphs` writes a real asset pack:
 
-- `mods/base/assets/fonts/{size}px/{font-name}/manifest.yaml`
-- `mods/base/assets/fonts/{size}px/{font-name}/glyphs/<char>.txt`
+- `mods/base/assets/fonts/{font-name}/{size}px/{mode}/manifest.yaml`
+- `mods/base/assets/fonts/{font-name}/{size}px/{mode}/glyphs/<char>.txt`
 
 Examples:
 
