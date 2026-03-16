@@ -56,9 +56,21 @@ impl RasterMode {
 
     fn from_id(value: &str) -> Option<Self> {
         match value {
-            "cell" => Some(RasterMode::TerminalPixels),
+            "cell" | "raster" | "terminal" | "tp" => Some(RasterMode::TerminalPixels),
             _ => Self::all().iter().copied().find(|mode| mode.id() == value),
         }
+    }
+
+    fn next(self) -> Self {
+        let modes = Self::all();
+        let index = modes.iter().position(|mode| *mode == self).unwrap_or(0);
+        modes[(index + 1) % modes.len()]
+    }
+
+    fn prev(self) -> Self {
+        let modes = Self::all();
+        let index = modes.iter().position(|mode| *mode == self).unwrap_or(0);
+        modes[(index + modes.len() - 1) % modes.len()]
     }
 }
 
@@ -410,9 +422,11 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
     let mut selected = 0usize;
     let mut preview_cache: HashMap<String, String> = HashMap::new();
     let mut message = String::new();
+    let mut last_command: Option<String> = None;
     let mut sample_text = PREVIEW_SAMPLE_TEXT.to_string();
     let mut preview_size = 22.0f32;
     let mut profile = RasterProfile::Classic;
+    let mut mode = RasterMode::Ascii;
     let mut online_catalog: Option<Vec<FontEntry>> = None;
     let _guard = TerminalGuard::new()?;
     let mut stdout = io::stdout();
@@ -424,6 +438,7 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
             &sample_text,
             preview_size,
             profile,
+            mode,
             &mut preview_cache,
             &mut message,
         );
@@ -435,8 +450,10 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
             &sample_text,
             preview_size,
             profile,
+            mode,
             &preview_cache,
             &message,
+            last_command.as_deref(),
         )?;
 
         if event::poll(Duration::from_millis(120)).context("failed while polling keyboard")? {
@@ -464,13 +481,13 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
                             message = "kept previous preview text".to_string();
                         }
                     }
-                    KeyCode::Char('=') | KeyCode::Char('+') => {
-                        preview_size = (preview_size + 2.0).min(80.0);
+                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                        preview_size = (preview_size - 2.0).max(8.0);
                         preview_cache.clear();
                         message = format!("preview size: {:.0}px", preview_size);
                     }
-                    KeyCode::Char('-') | KeyCode::Char('_') => {
-                        preview_size = (preview_size - 2.0).max(8.0);
+                    KeyCode::Char('=') | KeyCode::Char('+') => {
+                        preview_size = (preview_size + 2.0).min(80.0);
                         preview_cache.clear();
                         message = format!("preview size: {:.0}px", preview_size);
                     }
@@ -483,6 +500,16 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
                         profile = profile.next();
                         preview_cache.clear();
                         message = format!("profile: {}", profile.id());
+                    }
+                    KeyCode::Char('m') => {
+                        mode = mode.next();
+                        preview_cache.clear();
+                        message = format!("mode: {}", mode.id());
+                    }
+                    KeyCode::Char('M') => {
+                        mode = mode.prev();
+                        preview_cache.clear();
+                        message = format!("mode: {}", mode.id());
                     }
                     KeyCode::Char('s') => {
                         if let Some(found) =
@@ -529,10 +556,21 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
                             &sample_text,
                             preview_size,
                             profile,
-                            RasterMode::Ascii,
+                            mode,
                         );
-                        copy_text_osc52(&command, &mut stdout)?;
-                        message = "copied generate command to clipboard".to_string();
+                        last_command = Some(command.clone());
+                        match copy_text_osc52(&command, &mut stdout) {
+                            Ok(_) => {
+                                message =
+                                    "copied generate command to clipboard (also shown below)"
+                                        .to_string();
+                            }
+                            Err(error) => {
+                                message = format!(
+                                    "clipboard copy failed; command still visible below ({error})"
+                                );
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -552,12 +590,14 @@ fn draw_browser(
     sample_text: &str,
     preview_size: f32,
     profile: RasterProfile,
+    mode: RasterMode,
     preview_cache: &HashMap<String, String>,
     message: &str,
+    last_command: Option<&str>,
 ) -> Result<()> {
     let (w, h) = terminal::size().context("failed to read terminal size")?;
     let left_width = cmp::min(38u16, w.saturating_sub(20));
-    let list_height = h.saturating_sub(6) as usize;
+    let list_height = h.saturating_sub(7) as usize;
     let mut start = selected.saturating_sub(list_height / 2);
     if start + list_height > fonts.len() {
         start = fonts.len().saturating_sub(list_height);
@@ -571,15 +611,16 @@ fn draw_browser(
         Print("TTF Rasterizer Browser".bold()),
         MoveTo(0, 1),
         Print(
-            "↑/↓ j/k: nav   s: local search   S: online search   C: copy generate cmd   t: text   -/=: size   [ ]: profile   r: reload   q: quit"
+            "↑/↓ j/k: nav   s: local search   S: online search   Shift+C: copy cmd   t: text   -/=: size   [ ]: profile   m/M: mode   r: reload   q: quit"
         ),
         MoveTo(0, 2),
         Print(format!(
-            "fonts: {}/{}   size: {:.0}px   profile: {}   sample: {}",
+            "fonts: {}/{}   size: {:.0}px   profile: {}   mode: {}   sample: {}",
             fonts.len(),
             catalog_total,
             preview_size,
             profile.id(),
+            mode.id(),
             single_line_sample(sample_text, 36)
         ))
     )?;
@@ -612,10 +653,11 @@ fn draw_browser(
     )?;
 
     let preview_key = format!(
-        "{}|{:.1}|{}|{}",
+        "{}|{:.1}|{}|{}|{}",
         font_id(selected_font),
         preview_size,
         profile.id(),
+        mode.id(),
         sample_text
     );
     let preview_text = preview_cache
@@ -624,7 +666,7 @@ fn draw_browser(
         .unwrap_or("loading preview...");
     for (i, line) in preview_text.lines().enumerate() {
         let y = 3u16 + i as u16;
-        if y >= h.saturating_sub(1) {
+        if y >= h.saturating_sub(2) {
             break;
         }
         queue!(
@@ -634,6 +676,15 @@ fn draw_browser(
                 line,
                 w.saturating_sub(preview_x) as usize
             ))
+        )?;
+    }
+
+    if let Some(command) = last_command {
+        let command_line = format!("last command: {command}");
+        queue!(
+            stdout,
+            MoveTo(0, h.saturating_sub(2)),
+            Print(truncate_to_width(&command_line, w as usize))
         )?;
     }
 
@@ -654,15 +705,17 @@ fn ensure_preview(
     sample_text: &str,
     preview_size: f32,
     profile: RasterProfile,
+    mode: RasterMode,
     cache: &mut HashMap<String, String>,
     message: &mut String,
 ) {
     let entry = &fonts[index];
     let cache_key = format!(
-        "{}|{:.1}|{}|{}",
+        "{}|{:.1}|{}|{}|{}",
         font_id(entry),
         preview_size,
         profile.id(),
+        mode.id(),
         sample_text
     );
     if cache.contains_key(&cache_key) {
@@ -675,16 +728,17 @@ fn ensure_preview(
             sample_text,
             preview_size,
             profile,
-            RasterMode::Ascii,
+            mode,
         )
     }) {
         Ok(preview) => {
             cache.insert(cache_key, preview);
             *message = format!(
-                "loaded {} @ {:.0}px ({})",
+                "loaded {} @ {:.0}px ({} / {})",
                 entry.family,
                 preview_size,
-                profile.id()
+                profile.id(),
+                mode.id()
             );
         }
         Err(error) => {
@@ -840,7 +894,7 @@ fn build_generate_command(
     mode: RasterMode,
 ) -> String {
     let output = format!(
-        "mods/base/assets/fonts/{}-{}-{}-{}.txt",
+        "mod/shell-quest/assets/fonts/generated/{}-{}-{}-{}.txt",
         slugify(&entry.family),
         slugify(&entry.variant),
         profile.id(),
@@ -1515,7 +1569,19 @@ mod tests {
             parse_mode("cell").expect("cell alias should parse"),
             RasterMode::TerminalPixels
         );
+        assert_eq!(
+            parse_mode("raster").expect("raster alias should parse"),
+            RasterMode::TerminalPixels
+        );
         assert!(parse_mode("unknown").is_err());
+    }
+
+    #[test]
+    fn rotates_raster_mode() {
+        assert_eq!(RasterMode::Ascii.next(), RasterMode::TerminalPixels);
+        assert_eq!(RasterMode::TerminalPixels.next(), RasterMode::Ascii);
+        assert_eq!(RasterMode::Ascii.prev(), RasterMode::TerminalPixels);
+        assert_eq!(RasterMode::TerminalPixels.prev(), RasterMode::Ascii);
     }
 
     #[test]
