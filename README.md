@@ -10,6 +10,8 @@ Small Rust CLI for terminal font sprite previews and generation.
 - `cargo run -- preview --font "JetBrains Mono" --mode terminal-pixels --size 28`
 - `cargo run -- preview --font "JetBrains Mono" --mode cell --size 28` (alias of `terminal-pixels`)
 - `cargo run -- preview --font "JetBrains Mono" --mode raster --profile dense --size 30`
+- `cargo run -- preview --font "JetBrains Mono" --mode quad-block --profile classic --size 30`
+- `cargo run -- preview --font "JetBrains Mono" --mode braille --profile dense --size 30`
 - `cargo run -- generate --font "JetBrains Mono" --text "SHELL QUEST" --output out/title.txt`
 - `cargo run -- generate --font "JetBrains Mono" --mode terminal-pixels --chars "█▓▒░" --output out/tiles.txt`
 - `cargo run -- export-glyphs --font "JetBrains Mono" --size 24 --chars "AaBb0123" --output-dir ../../mods/base/assets/fonts`
@@ -18,7 +20,8 @@ Small Rust CLI for terminal font sprite previews and generation.
 
 - `-` / `=` change preview font size
 - `[` / `]` change profile (classic/dense/binary/inverted)
-- `m` / `M` change mode (ascii/terminal-pixels)
+- `m` / `M` change mode (`ascii`, `terminal-pixels`, `binary-block`, `half-block`, `quad-block`, `braille`)
+- `Ctrl+F` toggle fullscreen preview
 - `Shift+C` copies a fully parameterized `generate` command (font + text + size + profile + mode) and also shows that command in the browser footer
 
 ## Glyph asset export

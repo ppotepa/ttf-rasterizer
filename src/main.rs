@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
     style::{Print, Stylize},
     terminal::{
@@ -40,23 +40,42 @@ enum RasterProfile {
 enum RasterMode {
     Ascii,
     TerminalPixels,
+    BinaryBlock,
+    HalfBlock,
+    QuadBlock,
+    Braille,
 }
 
 impl RasterMode {
     fn all() -> &'static [RasterMode] {
-        &[RasterMode::Ascii, RasterMode::TerminalPixels]
+        &[
+            RasterMode::Ascii,
+            RasterMode::TerminalPixels,
+            RasterMode::BinaryBlock,
+            RasterMode::HalfBlock,
+            RasterMode::QuadBlock,
+            RasterMode::Braille,
+        ]
     }
 
     fn id(self) -> &'static str {
         match self {
             RasterMode::Ascii => "ascii",
             RasterMode::TerminalPixels => "terminal-pixels",
+            RasterMode::BinaryBlock => "binary-block",
+            RasterMode::HalfBlock => "half-block",
+            RasterMode::QuadBlock => "quad-block",
+            RasterMode::Braille => "braille",
         }
     }
 
     fn from_id(value: &str) -> Option<Self> {
         match value {
             "cell" | "raster" | "terminal" | "tp" => Some(RasterMode::TerminalPixels),
+            "binary" | "block" | "binary-pixels" => Some(RasterMode::BinaryBlock),
+            "half" | "halfblock" => Some(RasterMode::HalfBlock),
+            "quad" | "quadrant" | "2x2" => Some(RasterMode::QuadBlock),
+            "br" | "dots" => Some(RasterMode::Braille),
             _ => Self::all().iter().copied().find(|mode| mode.id() == value),
         }
     }
@@ -171,7 +190,7 @@ struct PreviewArgs {
     /// Raster profile: classic|dense|binary|inverted.
     #[arg(long, default_value = "classic")]
     profile: String,
-    /// Render mode: ascii|terminal-pixels.
+    /// Render mode: ascii|terminal-pixels|binary-block|half-block|quad-block|braille.
     #[arg(long, default_value = "ascii")]
     mode: String,
 }
@@ -201,7 +220,7 @@ struct GenerateArgs {
     /// Raster profile: classic|dense|binary|inverted.
     #[arg(long, default_value = "classic")]
     profile: String,
-    /// Render mode: ascii|terminal-pixels.
+    /// Render mode: ascii|terminal-pixels|binary-block|half-block|quad-block|braille.
     #[arg(long, default_value = "ascii")]
     mode: String,
     /// Output file path (sprite text).
@@ -231,7 +250,7 @@ struct ExportGlyphsArgs {
     /// Raster profile: classic|dense|binary|inverted.
     #[arg(long, default_value = "classic")]
     profile: String,
-    /// Render mode: ascii|terminal-pixels.
+    /// Render mode: ascii|terminal-pixels|binary-block|half-block|quad-block|braille.
     #[arg(long, default_value = "ascii")]
     mode: String,
     /// Output root directory, e.g. mods/base/assets/fonts.
@@ -427,6 +446,7 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
     let mut preview_size = 22.0f32;
     let mut profile = RasterProfile::Classic;
     let mut mode = RasterMode::Ascii;
+    let mut fullscreen_preview = false;
     let mut online_catalog: Option<Vec<FontEntry>> = None;
     let _guard = TerminalGuard::new()?;
     let mut stdout = io::stdout();
@@ -454,12 +474,21 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
             &preview_cache,
             &message,
             last_command.as_deref(),
+            fullscreen_preview,
         )?;
 
         if event::poll(Duration::from_millis(120)).context("failed while polling keyboard")? {
             match event::read().context("failed while reading keyboard event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        fullscreen_preview = !fullscreen_preview;
+                        message = if fullscreen_preview {
+                            "fullscreen preview: on".to_string()
+                        } else {
+                            "fullscreen preview: off".to_string()
+                        };
+                    }
                     KeyCode::Down | KeyCode::Char('j') => {
                         selected = cmp::min(selected + 1, browser_fonts.len().saturating_sub(1));
                     }
@@ -594,8 +623,74 @@ fn draw_browser(
     preview_cache: &HashMap<String, String>,
     message: &str,
     last_command: Option<&str>,
+    fullscreen_preview: bool,
 ) -> Result<()> {
     let (w, h) = terminal::size().context("failed to read terminal size")?;
+    let selected_font = &fonts[selected];
+    let preview_key = format!(
+        "{}|{:.1}|{}|{}|{}",
+        font_id(selected_font),
+        preview_size,
+        profile.id(),
+        mode.id(),
+        sample_text
+    );
+    let preview_text = preview_cache
+        .get(&preview_key)
+        .map(|s| s.as_str())
+        .unwrap_or("loading preview...");
+
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    if fullscreen_preview {
+        queue!(
+            stdout,
+            MoveTo(0, 0),
+            Print("TTF Rasterizer Fullscreen Preview (Ctrl+F to exit)".bold()),
+            MoveTo(0, 1),
+            Print(format!(
+                "font {}/{}: {} [{}]   size: {:.0}px   profile: {}   mode: {}",
+                selected + 1,
+                fonts.len(),
+                selected_font.family,
+                selected_font.variant,
+                preview_size,
+                profile.id(),
+                mode.id()
+            ))
+        )?;
+
+        for (i, line) in preview_text.lines().enumerate() {
+            let y = 3u16 + i as u16;
+            if y >= h.saturating_sub(2) {
+                break;
+            }
+            queue!(
+                stdout,
+                MoveTo(0, y),
+                Print(truncate_to_width(line, w as usize))
+            )?;
+        }
+
+        if let Some(command) = last_command {
+            let command_line = format!("last command: {command}");
+            queue!(
+                stdout,
+                MoveTo(0, h.saturating_sub(2)),
+                Print(truncate_to_width(&command_line, w as usize))
+            )?;
+        }
+
+        if !message.is_empty() {
+            queue!(
+                stdout,
+                MoveTo(0, h.saturating_sub(1)),
+                Print(truncate_to_width(message, w as usize))
+            )?;
+        }
+
+        return stdout.flush().context("failed to flush browser frame");
+    }
+
     let left_width = cmp::min(38u16, w.saturating_sub(20));
     let list_height = h.saturating_sub(7) as usize;
     let mut start = selected.saturating_sub(list_height / 2);
@@ -604,14 +699,13 @@ fn draw_browser(
     }
     let end = cmp::min(start + list_height, fonts.len());
 
-    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
     queue!(
         stdout,
         MoveTo(0, 0),
         Print("TTF Rasterizer Browser".bold()),
         MoveTo(0, 1),
         Print(
-            "↑/↓ j/k: nav   s: local search   S: online search   Shift+C: copy cmd   t: text   -/=: size   [ ]: profile   m/M: mode   r: reload   q: quit"
+            "↑/↓ j/k: nav   Ctrl+F: fullscreen   s: local search   S: online search   Shift+C: copy cmd   t: text   -/=: size   [ ]: profile   m/M: mode   r: reload   q: quit"
         ),
         MoveTo(0, 2),
         Print(format!(
@@ -637,7 +731,6 @@ fn draw_browser(
         row += 1;
     }
 
-    let selected_font = &fonts[selected];
     let preview_x = left_width + 2;
     queue!(
         stdout,
@@ -651,19 +744,6 @@ fn draw_browser(
         MoveTo(preview_x, 2),
         Print("preview:"),
     )?;
-
-    let preview_key = format!(
-        "{}|{:.1}|{}|{}|{}",
-        font_id(selected_font),
-        preview_size,
-        profile.id(),
-        mode.id(),
-        sample_text
-    );
-    let preview_text = preview_cache
-        .get(&preview_key)
-        .map(|s| s.as_str())
-        .unwrap_or("loading preview...");
     for (i, line) in preview_text.lines().enumerate() {
         let y = 3u16 + i as u16;
         if y >= h.saturating_sub(2) {
@@ -1431,25 +1511,199 @@ fn rasterize_line(
         }
     }
 
-    let ramp: Vec<char> = match mode {
-        RasterMode::Ascii => profile.ramp().chars().collect(),
-        RasterMode::TerminalPixels => terminal_pixel_ramp(profile),
-    };
-    let mut lines = Vec::with_capacity(max_height);
-    for y in 0..max_height {
-        let mut line = String::with_capacity(pen_x);
-        for x in 0..pen_x {
-            let p = canvas[y * pen_x + x] as usize;
+    render_canvas(&canvas, pen_x, max_height, profile, mode)
+}
+
+fn render_canvas(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    profile: RasterProfile,
+    mode: RasterMode,
+) -> Vec<String> {
+    match mode {
+        RasterMode::Ascii => render_ramp(canvas, width, height, profile.ramp().chars().collect()),
+        RasterMode::TerminalPixels => {
+            render_ramp(canvas, width, height, terminal_pixel_ramp(profile))
+        }
+        RasterMode::BinaryBlock => render_binary_block(canvas, width, height, profile),
+        RasterMode::HalfBlock => render_half_block(canvas, width, height, profile),
+        RasterMode::QuadBlock => render_quad_block(canvas, width, height, profile),
+        RasterMode::Braille => render_braille(canvas, width, height, profile),
+    }
+}
+
+fn render_ramp(canvas: &[u8], width: usize, height: usize, ramp: Vec<char>) -> Vec<String> {
+    let mut lines = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut line = String::with_capacity(width);
+        for x in 0..width {
+            let p = canvas[y * width + x] as usize;
             let idx = p * (ramp.len().saturating_sub(1)) / 255;
             line.push(ramp[idx]);
         }
-        while line.ends_with(' ') {
-            line.pop();
-        }
+        trim_line_end_spaces(&mut line);
         lines.push(line);
     }
-
     trim_vertical(lines)
+}
+
+fn render_binary_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+    let mut lines = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut line = String::with_capacity(width);
+        for x in 0..width {
+            let ch = if is_ink(canvas, width, height, x, y, profile) {
+                '█'
+            } else {
+                ' '
+            };
+            line.push(ch);
+        }
+        trim_line_end_spaces(&mut line);
+        lines.push(line);
+    }
+    trim_vertical(lines)
+}
+
+fn render_half_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+    let out_h = height.div_ceil(2);
+    let mut lines = Vec::with_capacity(out_h);
+    for oy in 0..out_h {
+        let sy = oy * 2;
+        let mut line = String::with_capacity(width);
+        for x in 0..width {
+            let top = is_ink(canvas, width, height, x, sy, profile);
+            let bottom = is_ink(canvas, width, height, x, sy + 1, profile);
+            let ch = match (top, bottom) {
+                (false, false) => ' ',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (true, true) => '█',
+            };
+            line.push(ch);
+        }
+        trim_line_end_spaces(&mut line);
+        lines.push(line);
+    }
+    trim_vertical(lines)
+}
+
+fn render_quad_block(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+    let out_w = width.div_ceil(2);
+    let out_h = height.div_ceil(2);
+    let mut lines = Vec::with_capacity(out_h);
+    for oy in 0..out_h {
+        let sy = oy * 2;
+        let mut line = String::with_capacity(out_w);
+        for ox in 0..out_w {
+            let sx = ox * 2;
+            let tl = is_ink(canvas, width, height, sx, sy, profile) as u8;
+            let tr = is_ink(canvas, width, height, sx + 1, sy, profile) as u8;
+            let bl = is_ink(canvas, width, height, sx, sy + 1, profile) as u8;
+            let br = is_ink(canvas, width, height, sx + 1, sy + 1, profile) as u8;
+            let mask = tl | (tr << 1) | (bl << 2) | (br << 3);
+            line.push(quad_char(mask));
+        }
+        trim_line_end_spaces(&mut line);
+        lines.push(line);
+    }
+    trim_vertical(lines)
+}
+
+fn render_braille(canvas: &[u8], width: usize, height: usize, profile: RasterProfile) -> Vec<String> {
+    let out_w = width.div_ceil(2);
+    let out_h = height.div_ceil(4);
+    let mut lines = Vec::with_capacity(out_h);
+    for oy in 0..out_h {
+        let sy = oy * 4;
+        let mut line = String::with_capacity(out_w);
+        for ox in 0..out_w {
+            let sx = ox * 2;
+            let mut mask = 0u8;
+            if is_ink(canvas, width, height, sx, sy, profile) {
+                mask |= 0b0000_0001;
+            }
+            if is_ink(canvas, width, height, sx, sy + 1, profile) {
+                mask |= 0b0000_0010;
+            }
+            if is_ink(canvas, width, height, sx, sy + 2, profile) {
+                mask |= 0b0000_0100;
+            }
+            if is_ink(canvas, width, height, sx + 1, sy, profile) {
+                mask |= 0b0000_1000;
+            }
+            if is_ink(canvas, width, height, sx + 1, sy + 1, profile) {
+                mask |= 0b0001_0000;
+            }
+            if is_ink(canvas, width, height, sx + 1, sy + 2, profile) {
+                mask |= 0b0010_0000;
+            }
+            if is_ink(canvas, width, height, sx, sy + 3, profile) {
+                mask |= 0b0100_0000;
+            }
+            if is_ink(canvas, width, height, sx + 1, sy + 3, profile) {
+                mask |= 0b1000_0000;
+            }
+            if mask == 0 {
+                line.push(' ');
+            } else {
+                line.push(char::from_u32(0x2800 + mask as u32).unwrap_or(' '));
+            }
+        }
+        trim_line_end_spaces(&mut line);
+        lines.push(line);
+    }
+    trim_vertical(lines)
+}
+
+fn is_ink(
+    canvas: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    profile: RasterProfile,
+) -> bool {
+    if x >= width || y >= height {
+        return false;
+    }
+    let mut value = canvas[y * width + x];
+    if matches!(profile, RasterProfile::Inverted) {
+        value = 255u8.saturating_sub(value);
+    }
+    let threshold = match profile {
+        RasterProfile::Dense => 96,
+        RasterProfile::Classic | RasterProfile::Binary | RasterProfile::Inverted => 128,
+    };
+    value >= threshold
+}
+
+fn quad_char(mask: u8) -> char {
+    match mask {
+        0 => ' ',
+        1 => '▘',
+        2 => '▝',
+        3 => '▀',
+        4 => '▖',
+        5 => '▌',
+        6 => '▞',
+        7 => '▛',
+        8 => '▗',
+        9 => '▚',
+        10 => '▐',
+        11 => '▜',
+        12 => '▄',
+        13 => '▙',
+        14 => '▟',
+        _ => '█',
+    }
+}
+
+fn trim_line_end_spaces(line: &mut String) {
+    while line.ends_with(' ') {
+        line.pop();
+    }
 }
 
 fn trim_vertical(lines: Vec<String>) -> Vec<String> {
@@ -1573,15 +1827,35 @@ mod tests {
             parse_mode("raster").expect("raster alias should parse"),
             RasterMode::TerminalPixels
         );
+        assert_eq!(
+            parse_mode("binary-block").expect("binary-block mode should parse"),
+            RasterMode::BinaryBlock
+        );
+        assert_eq!(
+            parse_mode("half").expect("half alias should parse"),
+            RasterMode::HalfBlock
+        );
+        assert_eq!(
+            parse_mode("quad").expect("quad alias should parse"),
+            RasterMode::QuadBlock
+        );
+        assert_eq!(
+            parse_mode("braille").expect("braille mode should parse"),
+            RasterMode::Braille
+        );
         assert!(parse_mode("unknown").is_err());
     }
 
     #[test]
     fn rotates_raster_mode() {
         assert_eq!(RasterMode::Ascii.next(), RasterMode::TerminalPixels);
-        assert_eq!(RasterMode::TerminalPixels.next(), RasterMode::Ascii);
-        assert_eq!(RasterMode::Ascii.prev(), RasterMode::TerminalPixels);
-        assert_eq!(RasterMode::TerminalPixels.prev(), RasterMode::Ascii);
+        assert_eq!(RasterMode::TerminalPixels.next(), RasterMode::BinaryBlock);
+        assert_eq!(RasterMode::BinaryBlock.next(), RasterMode::HalfBlock);
+        assert_eq!(RasterMode::HalfBlock.next(), RasterMode::QuadBlock);
+        assert_eq!(RasterMode::QuadBlock.next(), RasterMode::Braille);
+        assert_eq!(RasterMode::Braille.next(), RasterMode::Ascii);
+        assert_eq!(RasterMode::Ascii.prev(), RasterMode::Braille);
+        assert_eq!(RasterMode::Braille.prev(), RasterMode::QuadBlock);
     }
 
     #[test]
