@@ -595,9 +595,8 @@ fn run_browser(fonts: &[FontEntry]) -> Result<()> {
                         last_command = Some(command.clone());
                         match copy_text_osc52(&command, &mut stdout) {
                             Ok(_) => {
-                                message =
-                                    "copied generate command to clipboard (also shown below)"
-                                        .to_string();
+                                message = "copied generate command to clipboard (also shown below)"
+                                    .to_string();
                             }
                             Err(error) => {
                                 message = format!(
@@ -807,15 +806,9 @@ fn ensure_preview(
         return;
     }
 
-    match load_font_bytes(entry).and_then(|bytes| {
-        rasterize_text_to_ascii(
-            &bytes,
-            sample_text,
-            preview_size,
-            profile,
-            mode,
-        )
-    }) {
+    match load_font_bytes(entry)
+        .and_then(|bytes| rasterize_text_to_ascii(&bytes, sample_text, preview_size, profile, mode))
+    {
         Ok(preview) => {
             cache.insert(cache_key, preview);
             *message = format!(
@@ -1533,20 +1526,22 @@ fn render_canvas(
             profile.ramp().chars().collect(),
             trim_vertical_output,
         ),
-        RasterMode::TerminalPixels => {
-            render_ramp(
-                canvas,
-                width,
-                height,
-                terminal_pixel_ramp(profile),
-                trim_vertical_output,
-            )
-        }
+        RasterMode::TerminalPixels => render_ramp(
+            canvas,
+            width,
+            height,
+            terminal_pixel_ramp(profile),
+            trim_vertical_output,
+        ),
         RasterMode::BinaryBlock => {
             render_binary_block(canvas, width, height, profile, trim_vertical_output)
         }
-        RasterMode::HalfBlock => render_half_block(canvas, width, height, profile, trim_vertical_output),
-        RasterMode::QuadBlock => render_quad_block(canvas, width, height, profile, trim_vertical_output),
+        RasterMode::HalfBlock => {
+            render_half_block(canvas, width, height, profile, trim_vertical_output)
+        }
+        RasterMode::QuadBlock => {
+            render_quad_block(canvas, width, height, profile, trim_vertical_output)
+        }
         RasterMode::Braille => render_braille(canvas, width, height, profile, trim_vertical_output),
     }
 }
@@ -1837,7 +1832,11 @@ fn rasterize_glyph_for_export(
 
     let lines = render_canvas(&canvas, canvas_w, line_box.height, profile, mode, false);
     let art = lines.join("\n");
-    let rendered_w = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+    let rendered_w = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
     let advance_cells = match mode {
         RasterMode::QuadBlock | RasterMode::Braille => advance.div_ceil(2),
         _ => advance,
