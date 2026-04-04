@@ -43,3 +43,7 @@ fonts:
     variant: "regular"
     license: "OFL-1.1"
     ttf_url: "https://raw.githubusercontent.com/google/fonts/main/ofl/abrilfatface/AbrilFatface-Regular.ttf"
+  - family: "Orbitron"
+    variant: "bold"
+    license: "OFL-1.1"
+    ttf_url: "https://raw.githubusercontent.com/google/fonts/main/ofl/orbitron/Orbitron%5Bwght%5D.ttf"
